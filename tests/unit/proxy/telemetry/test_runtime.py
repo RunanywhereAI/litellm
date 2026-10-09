@@ -9,6 +9,7 @@ from litellm.proxy.telemetry.runtime import TelemetryRuntime, deployment_hasher
 from litellm.proxy.telemetry.settings import TelemetrySettings
 from litellm.telemetry.consent import ConsentGatedSink, TelemetryConsent
 from litellm.telemetry.records import AttemptRecord, InstanceInfo, RequestRecord, TelemetryGroup, UIEvent
+from tests.unit.proxy.telemetry.fake_database import SettingsDatabase
 
 _ENDPOINT: Final = "http://telemetry.invalid/v1/reports"
 
@@ -18,14 +19,15 @@ def _offline() -> httpx.AsyncClient:
 
 
 _HEARTBEAT: Final = TelemetryConsent(frozenset({TelemetryGroup.HEARTBEAT}))
+_SUCCESS: Final = TelemetryConsent(frozenset({TelemetryGroup.HEARTBEAT, TelemetryGroup.REQUEST_SUCCESS}))
 
 
-async def _stored_heartbeat() -> TelemetryConsent | None:
-    return _HEARTBEAT
-
-
-async def _broken_store() -> TelemetryConsent | None:
-    raise ConnectionError("db down")
+async def _started(settings: TelemetrySettings, db: SettingsDatabase | None) -> TelemetryRuntime:
+    runtime: Final = TelemetryRuntime()
+    await runtime.start(
+        litellm_version="1.0.0", settings=settings, db=lambda: db, register=lambda _logger: None, http_client=_offline
+    )
+    return runtime
 
 
 @pytest.mark.parametrize(
@@ -39,14 +41,31 @@ async def _broken_store() -> TelemetryConsent | None:
     ],
 )
 @pytest.mark.asyncio
-async def test_telemetry_stays_off_unless_valid_groups_and_an_endpoint_are_set_and_not_vetoed(
+async def test_without_a_database_telemetry_needs_valid_pinned_groups_an_endpoint_and_no_veto(
     settings: TelemetrySettings,
 ) -> None:
     registered: Final[list[TelemetryAttemptLogger]] = []  # mutable-ok: captures the register callback
     runtime: Final = TelemetryRuntime()
-    await runtime.start(litellm_version="1.0.0", settings=settings, register=registered.append, http_client=_offline)
+    await runtime.start(
+        litellm_version="1.0.0", settings=settings, db=lambda: None, register=registered.append, http_client=_offline
+    )
     assert runtime.sink is None
     assert registered == []
+
+
+@pytest.mark.asyncio
+async def test_a_veto_never_opens_the_database() -> None:
+    opened: Final[list[bool]] = []  # mutable-ok: records whether the db factory ran
+
+    def _db() -> SettingsDatabase:
+        opened.append(True)
+        return SettingsDatabase(stored_groups='{"groups": ["heartbeat"]}')
+
+    runtime: Final = TelemetryRuntime()
+    await runtime.start(
+        litellm_version="1.0.0", settings=TelemetrySettings(disabled=True), db=_db, register=lambda _logger: None
+    )
+    assert (runtime.sink, runtime.store, opened) == (None, None, [])
 
 
 @pytest.mark.asyncio
@@ -56,6 +75,7 @@ async def test_pinned_groups_register_the_attempt_logger_and_stop_cleanly() -> N
     await runtime.start(
         litellm_version="1.0.0",
         settings=TelemetrySettings(groups="HEARTBEAT", endpoint=_ENDPOINT, flush_interval_seconds=3600),
+        db=lambda: None,
         register=registered.append,
         http_client=_offline,
     )
@@ -66,39 +86,42 @@ async def test_pinned_groups_register_the_attempt_logger_and_stop_cleanly() -> N
 
 
 @pytest.mark.asyncio
-async def test_stored_groups_apply_when_no_groups_are_pinned_and_a_veto_ignores_them() -> None:
-    enabled: Final = TelemetryRuntime()
-    await enabled.start(
-        litellm_version="1.0.0",
-        settings=TelemetrySettings(endpoint=_ENDPOINT, flush_interval_seconds=3600),
-        register=lambda _logger: None,
-        http_client=_offline,
-        stored=_stored_heartbeat,
-    )
-    vetoed: Final = TelemetryRuntime()
-    await vetoed.start(
-        litellm_version="1.0.0",
-        settings=TelemetrySettings(endpoint=_ENDPOINT, disabled=True),
-        register=lambda _logger: None,
-        http_client=_offline,
-        stored=_stored_heartbeat,
-    )
-    assert enabled.sink is not None and enabled.sink.consent == _HEARTBEAT
-    assert vetoed.sink is None
-    await enabled.stop()
+async def test_pinned_groups_win_over_the_stored_groups() -> None:
+    db: Final = SettingsDatabase(stored_groups='{"groups": ["heartbeat", "request_success"]}')
+    runtime: Final = await _started(TelemetrySettings(groups="heartbeat", flush_interval_seconds=3600), db)
+    assert runtime.sink is not None and runtime.sink.consent == _HEARTBEAT
+    await runtime.stop()
 
 
 @pytest.mark.asyncio
-async def test_a_failing_settings_store_leaves_telemetry_off_instead_of_crashing_startup() -> None:
-    runtime: Final = TelemetryRuntime()
-    await runtime.start(
-        litellm_version="1.0.0",
-        settings=TelemetrySettings(endpoint=_ENDPOINT, flush_interval_seconds=3600),
-        register=lambda _logger: None,
-        http_client=_offline,
-        stored=_broken_store,
-    )
+async def test_stored_groups_are_picked_up_at_the_next_window_without_a_restart() -> None:
+    db: Final = SettingsDatabase()
+    runtime: Final = await _started(TelemetrySettings(flush_interval_seconds=3600), db)
     assert runtime.sink is None
+    db.stored_groups = '{"groups": ["heartbeat", "request_success"]}'
+    await runtime.refresh()
+    assert runtime.sink is not None and runtime.sink.consent == _SUCCESS
+    db.stored_groups = '{"groups": []}'
+    await runtime.refresh()
+    assert runtime.sink is None
+    await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_invalid_stored_groups_are_ignored_and_telemetry_stays_off() -> None:
+    db: Final = SettingsDatabase(stored_groups='{"groups": ["token_info"]}')
+    runtime: Final = await _started(TelemetrySettings(flush_interval_seconds=3600), db)
+    assert runtime.sink is None
+    await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_failing_settings_read_keeps_the_current_groups() -> None:
+    db: Final = SettingsDatabase(stored_groups='{"groups": ["heartbeat"]}')
+    runtime: Final = await _started(TelemetrySettings(flush_interval_seconds=3600), db)
+    db.fail_reads = True
+    await runtime.refresh()
+    assert runtime.sink is not None and runtime.sink.consent == _HEARTBEAT
     await runtime.stop()
 
 
@@ -110,12 +133,8 @@ def test_deployment_hashes_are_stable_per_install_and_differ_across_installs() -
 
 @pytest.mark.asyncio
 async def test_stop_waits_for_in_flight_request_finalizers_before_the_last_flush() -> None:
-    runtime: Final = TelemetryRuntime()
-    await runtime.start(
-        litellm_version="1.0.0",
-        settings=TelemetrySettings(groups="heartbeat", endpoint=_ENDPOINT, flush_interval_seconds=3600),
-        register=lambda _logger: None,
-        http_client=_offline,
+    runtime: Final = await _started(
+        TelemetrySettings(groups="heartbeat", endpoint=_ENDPOINT, flush_interval_seconds=3600), None
     )
     finished: Final[list[bool]] = []  # mutable-ok: records that the finalizer ran to completion
 
@@ -161,6 +180,7 @@ async def test_stop_during_an_export_lets_that_export_finish() -> None:
     await runtime.start(
         litellm_version="1.0.0",
         settings=TelemetrySettings(groups="heartbeat", endpoint=_ENDPOINT, flush_interval_seconds=0.001),
+        db=lambda: None,
         register=lambda _logger: None,
         http_client=_offline,
     )
@@ -180,6 +200,7 @@ async def test_settle_timeout_reads_the_configured_value_after_start_and_the_def
     await runtime.start(
         litellm_version="1.0.0",
         settings=TelemetrySettings(groups="heartbeat", endpoint=_ENDPOINT, settle_timeout_seconds=7.5),
+        db=lambda: None,
         register=lambda _logger: None,
         http_client=_offline,
     )
