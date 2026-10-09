@@ -1,6 +1,8 @@
 # tests/litellm/proxy/common_utils/test_upsert_budget_membership.py
+import json
 import types
 from datetime import datetime, timedelta, timezone
+from typing import Final
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -230,7 +232,11 @@ async def test_create_from_temp_budget_pair_only(mock_tx, fake_user):
     )
 
     mock_tx.litellm_budgettable.create.assert_awaited_once()
-    assert stored_budget_row(mock_tx) == {"temp_budget_increase": 5.0, "temp_budget_expiry": expiry}
+    assert stored_budget_row(mock_tx) == {
+        "model_max_budget": "{}",
+        "temp_budget_increase": 5.0,
+        "temp_budget_expiry": expiry,
+    }
     mock_tx.litellm_teammembership.upsert.assert_awaited_once()
     mock_tx.litellm_teammembership.update.assert_not_called()
 
@@ -252,7 +258,11 @@ async def test_create_from_temp_pair_never_snapshots_team_default(mock_tx, fake_
     )
 
     mock_tx.litellm_budgettable.find_unique.assert_not_awaited()
-    assert stored_budget_row(mock_tx) == {"temp_budget_increase": 1.0, "temp_budget_expiry": expiry}
+    assert stored_budget_row(mock_tx) == {
+        "model_max_budget": "{}",
+        "temp_budget_increase": 1.0,
+        "temp_budget_expiry": expiry,
+    }
     mock_tx.litellm_teammembership.upsert.assert_awaited_once()
 
 
@@ -274,7 +284,11 @@ async def test_temp_pair_on_shared_default_member_creates_bare_row(mock_tx, fake
 
     mock_tx.litellm_budgettable.find_unique.assert_not_awaited()
     mock_tx.litellm_budgettable.update.assert_not_called()
-    assert stored_budget_row(mock_tx) == {"temp_budget_increase": 1.0, "temp_budget_expiry": expiry}
+    assert stored_budget_row(mock_tx) == {
+        "model_max_budget": "{}",
+        "temp_budget_increase": 1.0,
+        "temp_budget_expiry": expiry,
+    }
     mock_tx.litellm_teammembership.upsert.assert_awaited_once()
 
 
@@ -337,7 +351,7 @@ async def test_create_from_plain_patch_does_not_snapshot_team_default(mock_tx, f
     )
 
     mock_tx.litellm_budgettable.find_unique.assert_not_awaited()
-    assert stored_budget_row(mock_tx) == {"tpm_limit": 500}
+    assert stored_budget_row(mock_tx) == {"model_max_budget": "{}", "tpm_limit": 500}
     mock_tx.litellm_teammembership.upsert.assert_awaited_once()
 
 
@@ -380,6 +394,7 @@ async def test_clone_on_write_from_shared_default(mock_tx, fake_user):
     assert create_data == {
         "created_by": fake_user.user_id,
         "updated_by": fake_user.user_id,
+        "model_max_budget": "{}",
         "max_budget": 50.0,  # caller wins
         "tpm_limit": 500,  # cloned from default
         "budget_duration": "1d",  # cloned from default
@@ -399,6 +414,36 @@ async def test_clone_on_write_from_shared_default(mock_tx, fake_user):
             },
         },
     )
+
+
+@pytest.mark.asyncio
+async def test_clone_on_write_preserves_model_caps_from_shared_nondefault_row(mock_tx, fake_user):
+    shared_budget_id: Final = "shared-member-budget"
+    model_caps: Final = {"gpt-4o": {"max_budget": 4.0, "budget_duration": "1d"}}
+    mock_tx.litellm_budgettable.find_unique = AsyncMock(
+        return_value=budget_row(
+            budget_id=shared_budget_id,
+            max_budget=100.0,
+            model_max_budget=model_caps,
+        )
+    )
+
+    await upsert_budget_and_membership(
+        mock_tx,
+        team_id="team-shared",
+        user_id="user-shared",
+        existing_budget_id=shared_budget_id,
+        user_api_key_dict=fake_user,
+        budget_patch={"tpm_limit": 1000},
+        team_default_budget_id="team-default-budget",
+        shared_budget_ids=frozenset({shared_budget_id}),
+    )
+
+    create_data: Final = mock_tx.litellm_budgettable.create.await_args.kwargs["data"]
+    persisted_model_caps: Final = create_data["model_max_budget"]
+    assert (
+        json.loads(persisted_model_caps) if isinstance(persisted_model_caps, str) else persisted_model_caps
+    ) == model_caps
 
 
 # TEST: forking the shared default while clearing its duration must drop the
@@ -431,6 +476,7 @@ async def test_clone_on_write_clears_duration(mock_tx, fake_user):
     assert create_data == {
         "created_by": fake_user.user_id,
         "updated_by": fake_user.user_id,
+        "model_max_budget": "{}",
         "max_budget": 200.0,
         "tpm_limit": 500,
         "budget_duration": None,
